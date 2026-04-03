@@ -63,6 +63,8 @@ created automatically in the same folder on first run.
    ```
 6. Done! Railway gives you a live URL like `https://dealflow-xxx.railway.app`
 
+**Auth URLs (same deployment):** full-page **Sign in** at `/login` and **Sign up** at `/register` (data is stored in your database — use Postgres below so users are not wiped on every redeploy).
+
 ### Using PostgreSQL on Railway (optional upgrade from SQLite)
 1. In Railway dashboard → Add Plugin → PostgreSQL
 2. It auto-injects `DATABASE_URL` into your environment

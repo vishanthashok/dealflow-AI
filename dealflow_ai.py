@@ -291,12 +291,27 @@ def optional_user(
 # SCHEMAS
 # ─────────────────────────────────────────────────────────────
 class RegisterIn(BaseModel):
-    email: str
+    email: EmailStr
     name: str
     password: str
 
+    @field_validator("name")
+    @classmethod
+    def name_ok(cls, v: str) -> str:
+        v = (v or "").strip()
+        if len(v) < 2:
+            raise ValueError("Name must be at least 2 characters")
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def password_ok(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return v
+
 class LoginIn(BaseModel):
-    email: str
+    email: EmailStr
     password: str
 
 class TokenOut(BaseModel):
@@ -364,6 +379,10 @@ class FeedStatusOut(BaseModel):
     sync_interval_minutes: int
     rss_feed_urls: List[str]
     newsapi_configured: bool
+
+class UserStatsOut(BaseModel):
+    bookmark_count: int
+    alert_count: int
 
 # ─────────────────────────────────────────────────────────────
 # SEED DATA
@@ -726,6 +745,11 @@ async def _feed_sync_loop():
 async def lifespan(app: FastAPI):
     global _feed_sync_task
     Base.metadata.create_all(bind=engine)
+    if os.getenv("RAILWAY_ENVIRONMENT") and "sqlite" in (DATABASE_URL or "").lower():
+        log.warning(
+            "DATABASE_URL is SQLite on Railway — user signups may be lost on redeploy. "
+            "Add the PostgreSQL plugin so Railway injects a persistent DATABASE_URL."
+        )
     db = SessionLocal()
     try:
         seed_database(db)
@@ -767,10 +791,10 @@ app.add_middleware(
 # ─────────────────────────────────────────────────────────────
 @app.post("/api/v1/auth/register", response_model=TokenOut, tags=["Auth"])
 def register(body: RegisterIn, db: Session = Depends(get_db)):
-    if db.query(UserModel).filter(UserModel.email == body.email).first():
+    if db.query(UserModel).filter(UserModel.email == str(body.email)).first():
         raise HTTPException(400, "Email already registered")
     user = UserModel(
-        email     = body.email,
+        email     = str(body.email),
         name      = body.name,
         hashed_pw = hash_password(body.password),
     )
@@ -779,7 +803,7 @@ def register(body: RegisterIn, db: Session = Depends(get_db)):
 
 @app.post("/api/v1/auth/login", response_model=TokenOut, tags=["Auth"])
 def login(body: LoginIn, db: Session = Depends(get_db)):
-    user = db.query(UserModel).filter(UserModel.email == body.email).first()
+    user = db.query(UserModel).filter(UserModel.email == str(body.email)).first()
     if not user or not verify_password(body.password, user.hashed_pw):
         raise HTTPException(401, "Invalid credentials")
     return _issue_tokens(user)
@@ -803,6 +827,12 @@ def refresh_token(creds: HTTPAuthorizationCredentials = Depends(bearer),
 @app.get("/api/v1/auth/me", response_model=UserOut, tags=["Auth"])
 def me(user: UserModel = Depends(get_current_user)):
     return user
+
+@app.get("/api/v1/auth/stats", response_model=UserStatsOut, tags=["Auth"])
+def auth_stats(user: UserModel = Depends(get_current_user), db: Session = Depends(get_db)):
+    bc = db.query(func.count(BookmarkModel.id)).filter(BookmarkModel.user_id == user.id).scalar()
+    ac = db.query(func.count(AlertModel.id)).filter(AlertModel.user_id == user.id).scalar()
+    return UserStatsOut(bookmark_count=int(bc or 0), alert_count=int(ac or 0))
 
 def _issue_tokens(user: UserModel) -> dict:
     access  = create_token({"sub": str(user.id), "type": "access"},
@@ -919,6 +949,16 @@ def bookmark_deal(deal_id: int, db: Session = Depends(get_db),
     db.commit()
     return {"bookmarked": True}
 
+@app.get("/api/v1/deals/bookmarks", response_model=List[DealOut], tags=["Deals"])
+def list_bookmarked_deals(user: UserModel = Depends(get_current_user), db: Session = Depends(get_db)):
+    return (
+        db.query(DealModel)
+        .join(BookmarkModel, BookmarkModel.deal_id == DealModel.id)
+        .filter(BookmarkModel.user_id == user.id)
+        .order_by(desc(BookmarkModel.created_at))
+        .all()
+    )
+
 # ─────────────────────────────────────────────────────────────
 # ALERTS ROUTES
 # ─────────────────────────────────────────────────────────────
@@ -947,10 +987,11 @@ def update_alert(alert_id: int, body: AlertIn,
     a = db.query(AlertModel).filter(AlertModel.id == alert_id,
                                     AlertModel.user_id == user.id).first()
     if not a: raise HTTPException(404, "Alert not found")
-    a.name      = body.name
-    a.sectors   = json.dumps(body.sectors) if body.sectors else None
-    a.min_size_m= body.min_size_m
-    a.keywords  = body.keywords
+    a.name       = body.name
+    a.sectors    = json.dumps(body.sectors) if body.sectors else None
+    a.buyer_types = json.dumps(body.buyer_types) if body.buyer_types else None
+    a.min_size_m = body.min_size_m
+    a.keywords   = body.keywords
     db.commit(); db.refresh(a)
     return a
 
@@ -1102,6 +1143,7 @@ header{
 }
 .nav-pill:hover{border-color:var(--accent);color:var(--accent)}
 .nav-pill.active{background:var(--accent);border-color:var(--accent);color:#000;font-weight:600}
+a.nav-pill{text-decoration:none;display:inline-flex;align-items:center;justify-content:center}
 #user-badge{
   display:none;
   align-items:center;gap:8px;
@@ -1197,7 +1239,7 @@ main{flex:1;padding:32px 24px;max-width:1400px;width:100%;margin:0 auto}
 .filter-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-right:4px}
 
 /* ── GRID ────────────────────────────────────────────────── */
-#deals-grid{
+#deals-grid,#saved-grid{
   display:grid;
   grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
   gap:16px;
@@ -1489,15 +1531,17 @@ main{flex:1;padding:32px 24px;max-width:1400px;width:100%;margin:0 auto}
     DealFlow <em style="font-style:italic;color:var(--accent)">AI</em>
   </div>
   <div class="nav-actions">
-    <button class="nav-pill active" onclick="showPage('deals')">Deals</button>
-    <button class="nav-pill" onclick="showPage('alerts')" id="alerts-nav">Alerts</button>
-    <div id="user-badge" onclick="logout()">
+    <button type="button" class="nav-pill active" id="nav-deals" onclick="showPage('deals', this)">Deals</button>
+    <button type="button" class="nav-pill" id="nav-saved" onclick="showPage('saved', this)">Saved</button>
+    <button type="button" class="nav-pill" id="nav-alerts" onclick="showPage('alerts', this)">Alerts</button>
+    <div id="user-badge" onclick="logout()" title="Click to sign out">
       <div class="avatar" id="user-avatar">U</div>
       <span id="user-name-badge">User</span>
+      <span id="user-stats-hint" style="font-size:10px;color:var(--muted);margin-left:6px"></span>
       <span style="font-size:10px;color:var(--muted)">⏻</span>
     </div>
-    <button class="nav-pill" id="login-btn" onclick="openAuth('login')">Sign In</button>
-    <button class="nav-pill active" id="register-btn" onclick="openAuth('register')">Get Access</button>
+    <a href="/login" class="nav-pill" id="login-btn">Sign In</a>
+    <a href="/register" class="nav-pill active" id="register-btn">Sign up</a>
   </div>
 </header>
 
@@ -1603,6 +1647,16 @@ main{flex:1;padding:32px 24px;max-width:1400px;width:100%;margin:0 auto}
     </div>
   </div>
 
+  <!-- SAVED / BOOKMARKS -->
+  <div id="saved-page" style="display:none">
+    <div class="hero">
+      <div class="hero-tag">♥ Your Pipeline</div>
+      <h1>Saved <em>Deals</em></h1>
+      <p>Bookmarks sync to your account — add PostgreSQL on Railway for persistence across deploys.</p>
+    </div>
+    <div id="saved-grid" class="deal-grid-page"></div>
+  </div>
+
 </main>
 </div>
 
@@ -1694,8 +1748,12 @@ let state = {
 // ── INIT ────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   updateAuthUI();
+  if (state.token) { refreshBookmarks(); fetchMe(); }
   loadDeals();
   loadTrending();
+  const nav = (new URLSearchParams(location.search)).get('nav');
+  if (nav === 'saved' && state.token) showPage('saved', document.getElementById('nav-saved'));
+  if (nav === 'alerts' && state.token) showPage('alerts', document.getElementById('nav-alerts'));
 });
 
 // ── AUTH UI ──────────────────────────────────────────────────
@@ -1703,15 +1761,39 @@ function updateAuthUI() {
   const li = document.getElementById('login-btn');
   const ri = document.getElementById('register-btn');
   const ub = document.getElementById('user-badge');
+  const hint = document.getElementById('user-stats-hint');
   if (state.user) {
     li.style.display = 'none'; ri.style.display = 'none';
     ub.style.display = 'flex';
     document.getElementById('user-avatar').textContent = state.user.name[0].toUpperCase();
     document.getElementById('user-name-badge').textContent = state.user.name.split(' ')[0];
+    refreshStats();
   } else {
     li.style.display = ''; ri.style.display = '';
     ub.style.display = 'none';
+    if (hint) hint.textContent = '';
   }
+}
+
+async function refreshStats() {
+  const hint = document.getElementById('user-stats-hint');
+  if (!state.token || !hint) return;
+  try {
+    const r = await apiFetch('/auth/stats');
+    if (!r.ok) return;
+    const s = await r.json();
+    hint.textContent = '♥ ' + s.bookmark_count + ' · 🔔 ' + s.alert_count;
+  } catch(e) {}
+}
+
+async function refreshBookmarks() {
+  if (!state.token) return;
+  try {
+    const r = await apiFetch('/deals/bookmarks');
+    if (!r.ok) return;
+    const deals = await r.json();
+    state.bookmarks = new Set(deals.map(d => d.id));
+  } catch(e) {}
 }
 
 function openAuth(mode) {
@@ -1739,6 +1821,7 @@ async function doLogin() {
     state.token = d.access_token;
     localStorage.setItem('df_token', d.access_token);
     await fetchMe();
+    await refreshBookmarks();
     closeAuth(); toast('Welcome back!', 'success');
     loadDeals();
   } catch(e) { errEl.textContent = 'Connection error'; errEl.style.display='block'; }
@@ -1761,6 +1844,7 @@ async function doRegister() {
     state.token = d.access_token;
     localStorage.setItem('df_token', d.access_token);
     await fetchMe();
+    await refreshBookmarks();
     closeAuth(); toast('Account created! Welcome.', 'success');
     loadDeals();
   } catch(e) { errEl.textContent = 'Connection error'; errEl.style.display='block'; }
@@ -1779,7 +1863,15 @@ function logout() {
   state.token = null; state.user = null;
   localStorage.removeItem('df_token');
   localStorage.removeItem('df_user');
-  updateAuthUI(); toast('Signed out'); loadDeals();
+  localStorage.removeItem('df_refresh');
+  updateAuthUI(); toast('Signed out');
+  const nd = document.getElementById('nav-deals');
+  document.querySelectorAll('header .nav-pill').forEach(b => b.classList.remove('active'));
+  if (nd) nd.classList.add('active');
+  document.getElementById('deals-page').style.display = '';
+  document.getElementById('alerts-page').style.display = 'none';
+  document.getElementById('saved-page').style.display = 'none';
+  loadDeals();
 }
 
 // ── API HELPER ───────────────────────────────────────────────
@@ -1853,7 +1945,7 @@ function dealCard(d) {
         <span class="source-tag">${escHtml(d.source_name||'')}</span>
         <button class="bookmark-btn ${bk?'active':''}" 
           onclick="event.stopPropagation();toggleBookmark(${d.id},this)"
-          title="Bookmark">♡</button>
+          title="Bookmark">${bk?'♥':'♡'}</button>
       </div>
     </div>
   </div>`;
@@ -1894,7 +1986,7 @@ function closeModal(e) {
 }
 
 async function toggleBookmark(id, btn) {
-  if (!state.token) { openAuth('login'); return; }
+  if (!state.token) { window.location.href='/login'; return; }
   const r = await apiFetch(`/deals/${id}/bookmark`, {method:'POST'});
   const d = await r.json();
   if (d.bookmarked) {
@@ -1904,6 +1996,8 @@ async function toggleBookmark(id, btn) {
     state.bookmarks.delete(id); btn.classList.remove('active');
     btn.textContent = '♡'; toast('Removed bookmark');
   }
+  refreshStats();
+  if (document.getElementById('saved-page').style.display==='block') loadSaved();
 }
 
 // ── TRENDING ─────────────────────────────────────────────────
@@ -1966,14 +2060,41 @@ function renderPagination() {
 function goPage(p) { state.page = p; loadDeals(); window.scrollTo({top:0,behavior:'smooth'}); }
 
 // ── PAGES ────────────────────────────────────────────────────
-function showPage(page) {
+function showPage(page, btn) {
   document.getElementById('deals-page').style.display = page==='deals' ? '' : 'none';
   document.getElementById('alerts-page').style.display = page==='alerts' ? 'block' : 'none';
-  document.querySelectorAll('.nav-pill').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
+  document.getElementById('saved-page').style.display = page==='saved' ? 'block' : 'none';
+  if (btn) {
+    document.querySelectorAll('header .nav-pill').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
   if (page==='alerts') {
-    if (!state.token) { openAuth('login'); showPage('deals'); return; }
+    if (!state.token) { window.location.href='/login'; return; }
     loadAlerts();
+  }
+  if (page==='saved') {
+    if (!state.token) { window.location.href='/login'; return; }
+    loadSaved();
+  }
+}
+
+async function loadSaved() {
+  const grid = document.getElementById('saved-grid');
+  grid.innerHTML = Array(4).fill(0).map(() =>
+    `<div class="deal-card" style="min-height:160px"><div class="skeleton" style="height:100%;min-height:140px;border-radius:8px"></div></div>`
+  ).join('');
+  try {
+    const r = await apiFetch('/deals/bookmarks');
+    if (!r.ok) throw new Error('auth');
+    const deals = await r.json();
+    state.bookmarks = new Set(deals.map(d => d.id));
+    if (!deals.length) {
+      grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><div class="empty-icon">♥</div><h3>No saved deals yet</h3><p>Open a deal card and tap the heart to save it to your pipeline.</p></div>`;
+      return;
+    }
+    grid.innerHTML = deals.map(d => dealCard(d)).join('');
+  } catch(e) {
+    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1"><h3>Could not load saved deals</h3><p>Try signing in again.</p></div>`;
   }
 }
 
@@ -1988,29 +2109,35 @@ async function loadAlerts() {
       list.innerHTML = '<div class="empty-state"><div class="empty-icon">🔔</div><h3>No alerts yet</h3><p>Create your first deal alert above</p></div>';
       return;
     }
-    list.innerHTML = data.map(a => `
+    list.innerHTML = data.map(a => {
+      let sec = '';
+      try { if (a.sectors) sec = JSON.parse(a.sectors).join(', '); } catch(x) {}
+      let bt = '';
+      try { if (a.buyer_types) bt = JSON.parse(a.buyer_types).join(', '); } catch(x) {}
+      return `
       <div class="alert-card">
         <div>
           <div class="alert-name">${escHtml(a.name)}</div>
           <div class="alert-details">
-            ${a.sectors ? 'Sectors: '+JSON.parse(a.sectors||'[]').join(', ')+' · ' : ''}
+            ${sec ? 'Sectors: '+escHtml(sec)+' · ' : ''}
+            ${bt ? 'Buyers: '+escHtml(bt)+' · ' : ''}
             ${a.min_size_m ? 'Min $'+a.min_size_m+'M · ' : ''}
-            ${a.keywords ? 'Keywords: '+a.keywords : ''}
+            ${a.keywords ? 'Keywords: '+escHtml(a.keywords) : ''}
             Created ${new Date(a.created_at).toLocaleDateString()}
           </div>
         </div>
         <div class="alert-actions">
           <button class="btn-danger" onclick="deleteAlert(${a.id})">Delete</button>
         </div>
-      </div>
-    `).join('');
+      </div>`;
+    }).join('');
   } catch(e) {
     list.innerHTML = '<div style="color:var(--red);text-align:center;padding:40px">Could not load alerts</div>';
   }
 }
 
 async function createAlert() {
-  if (!state.token) { openAuth('login'); return; }
+  if (!state.token) { window.location.href='/login'; return; }
   const name = document.getElementById('alert-name').value;
   const size = document.getElementById('alert-size').value;
   const sector = document.getElementById('alert-sector').value;
@@ -2019,13 +2146,13 @@ async function createAlert() {
   const body = { name, min_size_m: size ? parseFloat(size) : null,
     sectors: sector ? [sector] : null, keywords: kw || null };
   const r = await apiFetch('/alerts', {method:'POST', body: JSON.stringify(body)});
-  if (r.ok) { toast('Alert created!', 'success'); loadAlerts(); }
+  if (r.ok) { toast('Alert created!', 'success'); loadAlerts(); refreshStats(); }
   else toast('Failed to create alert', 'error');
 }
 
 async function deleteAlert(id) {
   const r = await apiFetch(`/alerts/${id}`, {method:'DELETE'});
-  if (r.ok) { toast('Alert deleted'); loadAlerts(); }
+  if (r.ok) { toast('Alert deleted'); loadAlerts(); refreshStats(); }
 }
 
 // ── UTILS ─────────────────────────────────────────────────────
@@ -2060,6 +2187,143 @@ document.addEventListener('keydown', e => {
 </script>
 </body>
 </html>"""
+
+
+def standalone_auth_page(mode: str) -> str:
+    """Dedicated full-page login/register (same API + localStorage keys as main app)."""
+    is_login = mode == "login"
+    endpoint = "/auth/login" if is_login else "/auth/register"
+    flip_href = "/register" if is_login else "/login"
+    flip_label = "Need an account? Register →" if is_login else "← Already have an account?"
+    h1 = "Welcome back" if is_login else "Create your account"
+    sub = (
+        "Sign in to sync bookmarks, alerts, and saved deals with your account."
+        if is_login
+        else "Password must be at least 8 characters. On Railway, add PostgreSQL so accounts survive redeploys."
+    )
+    btn = "Sign in" if is_login else "Create account"
+    if is_login:
+        fields = """
+      <div class="form-field"><label>Email</label>
+        <input type="email" id="email" required autocomplete="username" placeholder="you@company.com"/></div>
+      <div class="form-field"><label>Password</label>
+        <input type="password" id="password" required autocomplete="current-password"/></div>"""
+        body_js = "const body = { email, password };"
+    else:
+        fields = """
+      <div class="form-field"><label>Full name</label>
+        <input type="text" id="name" required autocomplete="name" placeholder="Alex Morgan"/></div>
+      <div class="form-field"><label>Email</label>
+        <input type="email" id="email" required autocomplete="username"/></div>
+      <div class="form-field"><label>Password</label>
+        <input type="password" id="password" required autocomplete="new-password" placeholder="8+ characters"/></div>"""
+        body_js = """const name = document.getElementById('name').value.trim();
+  if (!name) { err.textContent = 'Name required'; err.style.display = 'block'; return; }
+  const body = { email, name, password };"""
+
+    script = """async function submitAuth(e) {
+  e.preventDefault();
+  const err = document.getElementById('err');
+  err.style.display = 'none';
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+  __BODY__
+  try {
+    const r = await fetch(API + '__EP__', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      let msg = 'Request failed';
+      if (typeof d.detail === 'string') msg = d.detail;
+      else if (Array.isArray(d.detail)) msg = d.detail.map(x => x.msg || x.message || JSON.stringify(x)).join('; ');
+      err.textContent = msg;
+      err.style.display = 'block';
+      return;
+    }
+    localStorage.setItem('df_token', d.access_token);
+    localStorage.setItem('df_refresh', d.refresh_token || '');
+    const mr = await fetch(API + '/auth/me', { headers: { 'Authorization': 'Bearer ' + d.access_token } });
+    if (mr.ok) localStorage.setItem('df_user', JSON.stringify(await mr.json()));
+    const next = new URLSearchParams(location.search).get('next') || '/';
+    window.location.href = next;
+  } catch (x) {
+    err.textContent = 'Network error';
+    err.style.display = 'block';
+  }
+}
+document.getElementById('f').addEventListener('submit', submitAuth);
+""".replace(
+        "__BODY__", body_js
+    ).replace(
+        "__EP__", endpoint
+    )
+
+    page_title = "Sign in" if is_login else "Register"
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{page_title} — DealFlow AI</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Manrope:wght@400;600;700&display=swap" rel="stylesheet"/>
+<style>
+:root{{--bg:#0a0c0f;--surface:#111418;--border:#2a3040;--text:#e8eaf0;--muted:#6b7280;--accent:#00d4aa;--red:#ef4444}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{min-height:100vh;background:var(--bg);color:var(--text);font-family:'Manrope',sans-serif;display:flex;flex-direction:column}}
+.top{{display:flex;justify-content:space-between;align-items:center;padding:20px 28px;border-bottom:1px solid var(--border)}}
+.brand{{font-family:'DM Serif Display',serif;font-size:22px;color:var(--text);text-decoration:none;display:flex;align-items:center;gap:10px}}
+.dot{{width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent)}}
+.top a.link{{color:var(--muted);text-decoration:none;font-size:14px}}
+.top a.link:hover{{color:var(--accent)}}
+.wrap{{flex:1;display:flex;align-items:center;justify-content:center;padding:32px 20px}}
+.card{{width:100%;max-width:420px;background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:36px 32px}}
+h1{{font-family:'DM Serif Display',serif;font-size:32px;margin-bottom:8px}}
+.sub{{color:var(--muted);font-size:14px;margin-bottom:28px;line-height:1.6}}
+.form-field{{margin-bottom:18px}}
+label{{display:block;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}}
+input{{width:100%;padding:12px 14px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:15px;outline:none}}
+input:focus{{border-color:var(--accent)}}
+.btn-primary{{width:100%;margin-top:8px;padding:14px;border:none;border-radius:8px;background:var(--accent);color:#000;font-weight:700;font-size:15px;cursor:pointer}}
+.btn-primary:hover{{filter:brightness(1.06)}}
+.err{{display:none;color:var(--red);font-size:13px;margin-top:12px}}
+.flip{{text-align:center;margin-top:22px;font-size:14px;color:var(--muted)}}
+.flip a{{color:var(--accent);text-decoration:none}}
+footer{{text-align:center;padding:20px;color:var(--muted);font-size:12px;max-width:520px;margin:0 auto;line-height:1.5}}
+</style></head>
+<body>
+<header class="top">
+  <a class="brand" href="/"><span class="dot"></span> DealFlow <em style="color:var(--accent);font-style:italic">AI</em></a>
+  <a class="link" href="/">← Back to deals</a>
+</header>
+<div class="wrap">
+  <div class="card">
+    <h1>{h1}</h1>
+    <p class="sub">{sub}</p>
+    <form id="f">
+      {fields}
+      <button type="submit" class="btn-primary">{btn}</button>
+      <div class="err" id="err"></div>
+    </form>
+    <p class="flip"><a href="{flip_href}">{flip_label}</a></p>
+  </div>
+</div>
+<footer>User data lives in the app database. For production on Railway, attach the PostgreSQL plugin and use the injected <code style="color:var(--accent)">DATABASE_URL</code>.</footer>
+<script>
+const API = '/api/v1';
+{script}
+</script>
+</body></html>"""
+
+
+@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
+def auth_login_page():
+    return HTMLResponse(content=standalone_auth_page("login"))
+
+
+@app.get("/register", response_class=HTMLResponse, include_in_schema=False)
+def auth_register_page():
+    return HTMLResponse(content=standalone_auth_page("register"))
+
 
 @app.get("/", response_class=HTMLResponse)
 def serve_frontend():
