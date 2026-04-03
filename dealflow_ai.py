@@ -7,18 +7,22 @@
 Run:  python dealflow_ai.py
 Then: http://localhost:8000
 
-Deploy to Railway: just push this file + requirements_single.txt
+Deploy to Railway: push repo + requirements.txt; set SECRET_KEY, optional
+NEWSAPI_KEY, ADMIN_SYNC_SECRET, DEAL_RSS_FEEDS (see DEPLOY.md).
 """
 
 # ── stdlib ────────────────────────────────────────────────────
-import os, re, math, csv, json, hashlib, secrets, logging
+import os, re, math, csv, json, hashlib, secrets, logging, asyncio
+import urllib.request
+import urllib.parse
+from time import mktime
 from datetime import datetime, timedelta, timezone
 from io import StringIO
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from contextlib import asynccontextmanager
 
 # ── third-party (see requirements_single.txt) ────────────────
-from fastapi import FastAPI, Depends, HTTPException, Query, Request, status
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request, status
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -31,6 +35,10 @@ from sqlalchemy.orm import sessionmaker
 from pydantic import BaseModel, EmailStr, field_validator
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+import feedparser
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ─────────────────────────────────────────────────────────────
 # CONFIG
@@ -41,6 +49,9 @@ ALGORITHM      = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES  = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
 REFRESH_TOKEN_EXPIRE_DAYS    = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", 30))
 APP_PORT       = int(os.getenv("PORT", 8000))
+FEED_SYNC_INTERVAL_MINUTES = int(os.getenv("FEED_SYNC_INTERVAL_MINUTES", "30"))
+ADMIN_SYNC_SECRET = os.getenv("ADMIN_SYNC_SECRET", "").strip()
+NEWSAPI_KEY       = os.getenv("NEWSAPI_KEY", "").strip()
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dealflow")
@@ -162,6 +173,11 @@ SIZE_PATTERNS = [
     (r"([\d,.]+)\s*billion\s*dollar", 1000.0),
     (r"([\d,.]+)bn",               1000.0),
     (r"([\d,.]+)m\s+deal",            1.0),
+    (r"€\s*([\d,.]+)\s*billion",     1000.0),
+    (r"€\s*([\d,.]+)\s*bn",          1000.0),
+    (r"€\s*([\d,.]+)\s*million",       1.0),
+    (r"£\s*([\d,.]+)\s*billion",     1000.0),
+    (r"£\s*([\d,.]+)\s*million",       1.0),
 ]
 
 def classify_sector(text: str) -> str:
@@ -341,6 +357,14 @@ class TrendingOut(BaseModel):
     avg_score: float
     total_value_m: float
 
+class FeedStatusOut(BaseModel):
+    last_run: Optional[str] = None
+    last_added: int = 0
+    last_error: Optional[str] = None
+    sync_interval_minutes: int
+    rss_feed_urls: List[str]
+    newsapi_configured: bool
+
 # ─────────────────────────────────────────────────────────────
 # SEED DATA
 # ─────────────────────────────────────────────────────────────
@@ -476,18 +500,247 @@ def seed_database(db: Session):
 
 
 # ─────────────────────────────────────────────────────────────
+# LIVE FEEDS (RSS + optional NewsAPI)
+# ─────────────────────────────────────────────────────────────
+MA_HEADLINE_HINT = re.compile(
+    r"acqui(r|s|ring|red|res)|merger|m\s*&\s*a|buyout|\blbo\b|take[-\s]?private|takeover|"
+    r"\bbuys\b|\bpurchases\b|to\s+buy\s+|purchase\s+of|invests?\s+[$\d]|valued\s+at|"
+    r"go(ing)?[-\s]private|strategic\s+(deal|buyer)|minority\s+stake|majority\s+stake|"
+    r"leans\s+in|backs\s+[$\d]|close[sd]?\s+(the\s+)?(deal|acquisition)",
+    re.I,
+)
+
+DEFAULT_RSS_FEEDS = [
+    # Curated public RSS — swap for paid wires via DEAL_RSS_FEEDS
+    "https://news.google.com/rss/search?q=mergers+acquisitions+buyout&hl=en-US&gl=US&ceid=US:en",
+    "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "https://finance.yahoo.com/news/rssindex",
+]
+
+FEED_REQUEST_HEADERS = {
+    "User-Agent": "DealFlowAI/1.0 (+https://github.com/dealflow-ai; research bot)",
+    "Accept": "application/rss+xml, application/xml, application/atom+xml, text/xml, */*",
+}
+
+
+def _configured_feed_urls() -> List[str]:
+    raw = os.getenv("DEAL_RSS_FEEDS", "").strip()
+    if not raw:
+        return list(DEFAULT_RSS_FEEDS)
+    return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+def _feed_label_from_url(url: str) -> str:
+    try:
+        host = urllib.parse.urlparse(url).netloc.lower()
+        return host.replace("www.", "") or "RSS"
+    except Exception:
+        return "RSS"
+
+
+def _entry_datetime(entry) -> datetime:
+    for attr in ("published_parsed", "updated_parsed"):
+        parsed = getattr(entry, attr, None)
+        if parsed:
+            try:
+                return datetime.fromtimestamp(mktime(parsed), tz=timezone.utc).replace(tzinfo=None)
+            except (OverflowError, ValueError, TypeError):
+                continue
+    return datetime.utcnow()
+
+
+def _is_ma_headline(title: str, summary: str) -> bool:
+    return bool(MA_HEADLINE_HINT.search(f"{title} {summary or ''}"))
+
+def _strip_html(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"<[^>]+>", " ", s).strip()
+
+
+def _fetch_rss(url: str):
+    req = urllib.request.Request(url, headers=FEED_REQUEST_HEADERS, method="GET")
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        return feedparser.parse(resp.read())
+
+
+def ingest_rss_feeds(db: Session, feed_urls: Optional[List[str]] = None) -> int:
+    added = 0
+    for url in (feed_urls or _configured_feed_urls()):
+        label = _feed_label_from_url(url)
+        try:
+            parsed = _fetch_rss(url)
+            for entry in parsed.entries[:80]:
+                title = (entry.get("title") or "").strip()
+                if not title:
+                    continue
+                link = (entry.get("link") or "").strip() or None
+                summary = _strip_html(
+                    entry.get("summary") or entry.get("description") or ""
+                )[:4000]
+                if not _is_ma_headline(title, summary):
+                    continue
+                if not link:
+                    link = f"urn:feed:{hashlib.sha256(title.encode()).hexdigest()[:24]}"
+                if db.query(DealModel.id).filter(DealModel.source_url == link).first():
+                    continue
+                clf = classify_article(title, summary)
+                deal = DealModel(
+                    title=title,
+                    summary=summary or None,
+                    source_url=link,
+                    source_name=parsed.feed.get("title") or label,
+                    published_at=_entry_datetime(entry),
+                    acquirer=None,
+                    target=None,
+                    **clf,
+                )
+                db.add(deal)
+                added += 1
+        except Exception as e:
+            log.warning("RSS ingest failed for %s: %s", url, e)
+    return added
+
+
+def ingest_newsapi(db: Session) -> int:
+    if not NEWSAPI_KEY:
+        return 0
+    added = 0
+    q = os.getenv(
+        "NEWSAPI_QUERY",
+        '("merger" OR "acquisition" OR buyout OR "take private")',
+    )
+    params = urllib.parse.urlencode(
+        {
+            "q": q,
+            "language": "en",
+            "sortBy": "publishedAt",
+            "pageSize": 40,
+            "apiKey": NEWSAPI_KEY,
+        }
+    )
+    url = f"https://newsapi.org/v2/everything?{params}"
+    req = urllib.request.Request(url, headers=FEED_REQUEST_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception as e:
+        log.warning("NewsAPI request failed: %s", e)
+        return 0
+    if payload.get("status") != "ok":
+        log.warning("NewsAPI error: %s", payload.get("message") or payload)
+        return 0
+    for art in payload.get("articles") or []:
+        title = (art.get("title") or "").strip()
+        if not title:
+            continue
+        summary = (art.get("description") or "")[:4000]
+        if not _is_ma_headline(title, summary):
+            continue
+        link = (art.get("url") or "").strip()
+        if not link:
+            continue
+        if db.query(DealModel.id).filter(DealModel.source_url == link).first():
+            continue
+        pub = art.get("publishedAt")
+        try:
+            published_at = (
+                datetime.fromisoformat(pub.replace("Z", "+00:00")).replace(tzinfo=None)
+                if pub
+                else datetime.utcnow()
+            )
+        except ValueError:
+            published_at = datetime.utcnow()
+        src = (art.get("source") or {}).get("name") or "NewsAPI"
+        clf = classify_article(title, summary)
+        db.add(
+            DealModel(
+                title=title,
+                summary=summary or None,
+                source_url=link,
+                source_name=src,
+                published_at=published_at,
+                acquirer=None,
+                target=None,
+                **clf,
+            )
+        )
+        added += 1
+    return added
+
+
+FEED_SYNC_STATE = {
+    "last_run": None,
+    "last_added": 0,
+    "last_error": None,
+}
+
+
+def run_live_feed_sync() -> Tuple[int, Optional[str]]:
+    """Pull RSS + optional NewsAPI into DB. Returns (new_row_count, error)."""
+    db = SessionLocal()
+    err = None
+    total = 0
+    try:
+        total += ingest_rss_feeds(db)
+        total += ingest_newsapi(db)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        err = str(e)
+        log.exception("Live feed sync failed")
+    finally:
+        db.close()
+    FEED_SYNC_STATE["last_run"] = datetime.utcnow().isoformat() + "Z"
+    FEED_SYNC_STATE["last_added"] = total if err is None else 0
+    FEED_SYNC_STATE["last_error"] = err
+    return (total, err)
+
+
+# ─────────────────────────────────────────────────────────────
+# APP LIFECYCLE
+# ─────────────────────────────────────────────────────────────
+_feed_sync_task: Optional[asyncio.Task] = None
+
+
+async def _feed_sync_loop():
+    await asyncio.sleep(8)
+    while True:
+        try:
+            added, err = await asyncio.to_thread(run_live_feed_sync)
+            if err:
+                log.error("Scheduled feed sync error: %s", err)
+            else:
+                log.info("Scheduled feed sync: %s new deals", added)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Scheduled feed sync crashed")
+        await asyncio.sleep(max(1, FEED_SYNC_INTERVAL_MINUTES) * 60)
+
+
+# ─────────────────────────────────────────────────────────────
 # APP LIFESPAN
 # ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _feed_sync_task
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
         seed_database(db)
     finally:
         db.close()
+    if FEED_SYNC_INTERVAL_MINUTES > 0:
+        _feed_sync_task = asyncio.create_task(_feed_sync_loop())
     log.info(f"DealFlow AI ready → http://localhost:{APP_PORT}")
     yield
+    if _feed_sync_task:
+        _feed_sync_task.cancel()
+        try:
+            await _feed_sync_task
+        except asyncio.CancelledError:
+            pass
 
 # ─────────────────────────────────────────────────────────────
 # FASTAPI APP
@@ -729,6 +982,33 @@ def company_deals(name: str, db: Session = Depends(get_db)):
 @app.get("/api/health", tags=["System"])
 def health():
     return {"status": "ok", "version": "1.0.0", "timestamp": datetime.utcnow()}
+
+@app.get("/api/v1/system/feeds", response_model=FeedStatusOut, tags=["System"])
+def feeds_status():
+    return FeedStatusOut(
+        last_run=FEED_SYNC_STATE.get("last_run"),
+        last_added=int(FEED_SYNC_STATE.get("last_added") or 0),
+        last_error=FEED_SYNC_STATE.get("last_error"),
+        sync_interval_minutes=FEED_SYNC_INTERVAL_MINUTES,
+        rss_feed_urls=_configured_feed_urls(),
+        newsapi_configured=bool(NEWSAPI_KEY),
+    )
+
+@app.post("/api/v1/system/sync-feeds", tags=["System"])
+def trigger_feed_sync(
+    x_admin_sync_secret: Optional[str] = Header(None, alias="X-Admin-Sync-Secret"),
+):
+    """
+    Run ingestion immediately (RSS + optional NewsAPI). On Railway, call from a
+    Cron job or workflow. Set ADMIN_SYNC_SECRET and pass it in this header.
+    """
+    if ADMIN_SYNC_SECRET:
+        if not x_admin_sync_secret or x_admin_sync_secret != ADMIN_SYNC_SECRET:
+            raise HTTPException(401, "Missing or invalid X-Admin-Sync-Secret")
+    added, err = run_live_feed_sync()
+    if err:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err)
+    return {"ok": True, "added": added, "last_run": FEED_SYNC_STATE["last_run"]}
 
 # ─────────────────────────────────────────────────────────────
 # FRONTEND (served at root — full embedded SPA)
